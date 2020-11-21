@@ -132,6 +132,10 @@ class Basis:
         shape[np.array(self.shape) == 1] = 1
         return tuple(shape)
 
+    def grid_spacing(self, **kwargs):
+        """Global grids spacings."""
+        raise NotImplementedError
+
     def global_grids(self, scales):
         """Global grids."""
         # Subclasses must implement
@@ -266,6 +270,12 @@ class IntervalBasis(Basis):
         self.dealias = (dealias,)
         self.COV = AffineCOV(self.native_bounds, bounds)
         super().__init__(coord)
+
+    @CachedMethod
+    def grid_spacing(self, scale=None):
+        """Global grids spacings."""
+        grid = self.global_grid(scale=scale)
+        return np.gradient(grid.flatten()).reshape(grid.shape)
 
     # Why do we need this?
     def global_grids(self, scales=None):
@@ -499,6 +509,20 @@ class Jacobi(IntervalBasis, metaclass=CachedClass):
         matrix = convert @ matrix
         return matrix[:N, :N]
 
+
+    @CachedMethod
+    def grid_spacing(self, scale=None):
+        """Global Jacobi grids spacings."""
+        #Special case for ChebyshevT (a=b=-1/2)
+        if self.a == -1/2 and self.b == -1/2:
+            if scale is None: scale = 1
+            N = self.grid_shape((scale,))[0]
+            i = np.arange(N)
+            theta = np.pi * (i + 1/2) / N
+            native_spacing = np.sin(theta) * np.pi / N
+            return native_spacing * self.COV.stretch
+        else:
+            super(Jacobi, self).grid_spacing(scale=scale)
 
 def Legendre(*args, **kw):
     return Jacobi(*args, a=0, b=0, **kw)
@@ -744,6 +768,14 @@ class ComplexFourier(IntervalBasis):
         return (2 * np.pi / N) * np.arange(N)
 
     @CachedMethod
+    def grid_spacing(self, scale=None):
+        """Global Fourier grids spacings."""
+        if scale is None: scale = 1
+        N = self.grid_shape((scale,))[0]
+        native_spacing = 2 * np.pi / N * np.ones(N)
+        return native_spacing * self.COV.stretch
+
+    @CachedMethod
     def transform_plan(self, grid_size):
         """Build transform plan."""
         return self.transforms[self.library](grid_size, self.size)
@@ -953,6 +985,14 @@ class RealFourier(IntervalBasis):
         """Native flat global grid."""
         N, = self.grid_shape((scale,))
         return (2 * np.pi / N) * np.arange(N)
+
+    @CachedMethod
+    def grid_spacing(self, scale=None):
+        """Global Fourier grids spacings."""
+        if scale is None: scale = 1
+        N = self.grid_shape((scale,))
+        native_spacing = 2 * np.pi / N[0] * np.ones(N)
+        return native_spacing * self.COV.stretch
 
     @CachedMethod
     def transform_plan(self, grid_size):
@@ -1328,6 +1368,9 @@ class MultidimensionalBasis(Basis):
         subaxis = axis - self.axis
         return self.backward_transforms[subaxis](field, axis, cdata, gdata)
 
+    def grid_spacing(self, axis, scales=None):
+        """Global grids spacings."""
+        raise NotImplementedError
 
 def reduced_view_5(data, axis1, axis2):
     shape = data.shape
@@ -1756,6 +1799,20 @@ class PolarBasis(SpinBasis):
         if scales == None: scales = (1, 1)
         return (self.global_grid_azimuth(scales[0]),
                 self.global_grid_radius(scales[1]))
+
+    def global_grid_radius(self, scale):
+        r = self.radial_COV.problem_coord(self._native_radius_grid(scale))
+        return reshape_vector(r, dim=self.dist.dim, axis=self.axis+1)
+
+    @CachedMethod
+    def grid_spacing(self, axis, scales=None):
+        """Global grids spacings."""
+        if scales is None: scales = (1,1)
+        if self.dims[axis] == 'azimuth':
+            # Scale grid spacing [ 1 / (mmax + 1) ] by the outer radius of the domain
+            return self.radius * np.ones(self.grid_shape(scales)[axis]) / (self.mmax + 1)
+        elif self.dims[axis] == 'radius':
+            return np.gradient(self.global_grid_radius(scales[axis]).flatten())
 
     def local_grids(self, scales=None):
         if scales == None: scales = (1, 1)
@@ -2649,6 +2706,12 @@ class SpinWeightedSphericalHarmonics(SpinBasis):
     def global_grid_colatitude(self, scale):
         theta = self._native_colatitude_grid(scale)
         return reshape_vector(theta, dim=self.dist.dim, axis=self.axis+1)
+
+    @CachedMethod
+    def grid_spacing(self, axis, scales=None):
+        """Global grids spacings."""
+        if scales is None: scales = (1,1)
+        return self.radius * np.ones(self.grid_shape(scales)) / (self.Lmax + 1)
 
     def local_grids(self, scales=None):
         if scales == None: scales = (1, 1)
@@ -3756,6 +3819,16 @@ class SphericalShellBasis(Spherical3DBasis):
         if self.k > 0:
             gdata *= radial_basis.radial_transform_factor(field.scales[axis], data_axis, self.k)
 
+    @CachedMethod
+    def grid_spacing(self, axis, scales=None):
+        """Global grids spacings."""
+        if scales is None: scales = (1,1,1)
+        if self.dims[axis] == 'azimuth' or self.dims[axis] == 'colatitude':
+            # Scale grid spacing [ 1 / (Lmax + 1) ] by the outer radius of the domain
+            return self.global_grid_radius(scales[2]) * self.sphere_basis.grid_spacing(axis, scales=scales)[:,:,None]
+        elif self.dims[axis] == 'radius':
+            return np.gradient(self.global_grid_radius(scales[axis]).flatten())
+
 
 class BallBasis(Spherical3DBasis):
 
@@ -3874,6 +3947,16 @@ class BallBasis(Spherical3DBasis):
         np.copyto(gdata, temp)
         # Apply regularity recombinations
         radial_basis.backward_regularity_recombination(field.tensorsig, axis, gdata, ell_maps=self.ell_maps)
+
+    @CachedMethod
+    def grid_spacing(self, axis, scales=None):
+        """Global grids spacings."""
+        if scales is None: scales = (1,1,1)
+        if self.dims[axis] == 'azimuth' or self.dims[axis] == 'colatitude':
+            # Scale grid spacing [ 1 / (Lmax + 1) ] by the outer radius of the domain
+            return np.ones_like(self.global_grid_radius(scales[2])) * self.radial_basis.radius * self.sphere_basis.grid_spacing(axis, scales=scales)[:, :, None]
+        elif self.dims[axis] == 'radius':
+            return np.gradient(self.global_grid_radius(scales[axis]).flatten())
 
 def prod(arg):
     if arg:
